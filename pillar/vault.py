@@ -15,13 +15,14 @@ following options:
           url: https://vault:8200
           config: Local path or salt:// URL to secret configuration file
           token: Explicit token for token authentication
-          app_id: Application ID for app-id authentication
-          user_id: Explicit User ID for app-id authentication
-          user_file: File to read for user-id value
+          token_file: File containing a Vault token to use
           role_id: Role ID for AppRole authentication
           secret_id: Explicit Secret ID for AppRole authentication
           secret_file: File to read for secret-id value
           unset_if_missing: Leave pillar key unset if Vault secret not found
+          memcached_socket: Path to a unix socket, e.g. /var/run/memcached/memcached.sock
+          memcached_expiration: Number of seconds to cache secrets for e.g. 60
+          memcached_timeout: Number of seconds to wait before timing out e.g. 1
 
 The ``url`` parameter is the full URL to the Vault API endpoint.
 
@@ -30,13 +31,8 @@ The ``config`` parameter is the path or salt:// URL to the secret map YML file.
 The ``token`` parameter is an explicit token to use for authentication, and it
 overrides all other authentication methods.
 
-The ``app_id`` parameter is an Application ID to use for app-id authentication.
-
-The ``user_id`` parameter is an explicit User ID to pair with ``app_id`` for
-app-id authentication.
-
-The ``user_file`` parameter is the path to a file on the master to read for a
-``user-id`` value if ``user_id`` is not specified.
+The ``token_file`` parameter is the path to a file containing a token, such
+as output by Vault Agent.
 
 The ``role_id`` parameter is a Role ID to use for AppRole authentication.
 
@@ -50,6 +46,17 @@ The ``unset_if_missing`` parameter determins behavior when the Vault secret is
 missing or otherwise inaccessible. If set to ``True``, the pillar key is left
 unset. If set to ``False``, the pillar key is set to ``None``. Default is
 ``False``
+
+The ``memcached_socket`` parameter is the path to a unix socket on the master
+to use for caching vault secrets.  Expiration of cached secrets defaults to
+5 minutes.
+
+The ``memcached_timeout`` parameter sets the memcache connection `timeout`
+and `connect_timeout`.  Takes an integer number of seconds.
+
+The ``memcached_expiration`` parameter specifies the number of seconds to
+keep secrets cached in memcached before they must be fetched from Vault
+again.  Defaults to 300 (5 minutes).
 
 Mapping Vault Secrets to Minions
 --------------------------------
@@ -110,6 +117,13 @@ try:
 except ImportError:
     HAS_HVAC = False
 
+# Get pymemcache
+try:
+    from pymemcache.client.base import Client as memclient
+    MEMCACHE_CAPABLE = True
+except ImportError:
+    MEMCACHE_CAPABLE = False
+
 # Set up logging
 LOG = logging.getLogger(__name__)
 
@@ -118,13 +132,14 @@ CONF = {
     'url': 'https://vault:8200',
     'config': '/srv/salt/secrets.yml',
     'token': None,
-    'app_id': None,
-    'user_id': None,
-    'user_file': None,
+    'token_file': None,
     'role_id': None,
     'secret_id': None,
     'secret_file': None,
-    'unset_if_missing': False
+    'unset_if_missing': False,
+    'memcached_socket': None,
+    'memcached_timeout': 1,
+    'memcached_expiration': 300
 }
 
 def __virtual__():
@@ -141,17 +156,16 @@ def _get_id_from_file(source="/.vault-id"):
     """ Reads a UUID from file (default: /.vault-id)
     """
     source = os.path.abspath(os.path.expanduser(source))
-    LOG.debug("Reading '%s' for user_id", source)
+    LOG.debug("Reading '%s' for uuid", source)
 
-    user_id = ""
+    uuid = ""
 
     # pylint: disable=invalid-name
     if os.path.isfile(source):
-        fd = open(source, "r")
-        user_id = fd.read()
-        fd.close()
+        with open(source, "r") as fd:
+            uuid = fd.read()
 
-    return user_id.rstrip()
+    return uuid.strip()
 
 
 def _authenticate(conn):
@@ -162,6 +176,11 @@ def _authenticate(conn):
     # Check for explicit token, first
     if CONF["token"]:
         conn.token = CONF["token"]
+
+    # Check for token file, such as output by Vault Agent
+    elif CONF["token_file"]:
+        token = _get_id_from_file(CONF["token_file"])
+        conn.token = token
 
     # Check for explicit AppRole authentication
     elif CONF["role_id"]:
@@ -178,62 +197,60 @@ def _authenticate(conn):
         # is merged, due in hvac 0.3.0
         conn.token = result['auth']['client_token']
 
-    # Check for explicit app-id authentication
-    elif CONF["app_id"]:
-        # Check possible sources for user-id
-        if CONF["user_id"]:
-            user_id = CONF["user_id"]
-        elif CONF["user_file"]:
-            user_id = _get_id_from_file(source=CONF["user_file"])
-        else:
-            user_id = _get_id_from_file()
-
-        # Perform app-id authentication
-        conn.auth_app_id(CONF["app_id"], user_id)
-
-    # TODO: Add additional auth methods here
-
     # Check for token in ENV
     elif os.environ.get('VAULT_TOKEN'):
         conn.token = os.environ.get('VAULT_TOKEN')
 
 
-def couple(location, conn):
-    """
-    If location is a dictionary, loop over its keys, and call couple() for each key
-    If location is a string, return the value looked up from vault.
-    """
-    coupled_data = {}
-    if isinstance(location, basestring):
-        try:
-            (path, key) = location.split('?', 1)
-        except ValueError:
-            (path, key) = (location, None)
-        secret = conn.read(path)
-        if key:
-            secret = secret["data"].get(key, None)
-            prefix = "base64:"
-            if secret and secret.startswith(prefix):
-                secret = base64.b64decode(secret[len(prefix):]).rstrip()
-        if secret or not CONF["unset_if_missing"]:
-            return secret
-    elif isinstance(location, dict):
-        for return_key, real_location in location.items():
-            coupled_data[return_key] = couple(real_location, conn)
-    if coupled_data or not CONF["unset_if_missing"]:
-        return coupled_data
+def fetch(vault_conn, mem_conn, location, expire_seconds=300,
+        unset_if_missing=False):
+    """Takes a location in Vault and connection to Vault + optionally memcache.
 
+    Args:
+        vault_conn: hvac.Client connection object that has been
+                    pre-authenticated.
+        mem_conn: pymemcache connection object or None.
+        location: string path of Vault key with '?' delimiter between path
+                  and desired field.
+    Returns: Requested secret as a string.
+    """
+    if mem_conn:
+        secret = mem_conn.get(location)
+        if secret is not None:
+            LOG.debug("Get cached value for '%s'", location)
+            return secret
+    try:
+        (path, key) = location.split('?', 1)
+    except ValueError:
+        (path, key) = (location, None)
+    secret = vault_conn.read(path)
+    if key:
+        secret = secret["data"].get(key, None)
+        prefix = "base64:"
+        if secret and secret.startswith(prefix):
+            secret = base64.b64decode(secret[len(prefix):]).rstrip()
+    if secret or not unset_if_missing:
+        if mem_conn:
+            LOG.debug("Set cached value for '%s'", location)
+            mem_conn.set(location, secret, expire=expire_seconds)
+        return secret
 
 
 def ext_pillar(minion_id, pillar, *args, **kwargs):
     """ Main handler. Compile pillar data for the specified minion ID
     """
-    vault_pillar = {}
+    vault_pillar = pillar
 
     # Load configuration values
     for key in CONF:
         if kwargs.get(key, None):
             CONF[key] = kwargs.get(key)
+
+    # Determine whether to enable secret caching
+    if MEMCACHE_CAPABLE and CONF['memcached_socket']:
+        memcache_enabled = True
+    else:
+        memcache_enabled = False
 
     # Resolve salt:// fileserver path, if necessary
     if CONF["config"].startswith("salt://"):
@@ -255,22 +272,39 @@ def ext_pillar(minion_id, pillar, *args, **kwargs):
         LOG.error("'url' must be specified for Vault configuration")
         return vault_pillar
 
+    # Create a memcached connection if configured
+    if memcache_enabled:
+        LOG.info("Starting memcached connection for secrets pillar")
+        mem_conn = memclient(
+            CONF['memcached_socket'],
+            connect_timeout=CONF['memcached_timeout'],
+            timeout=CONF['memcached_timeout'])
+    else:
+        LOG.info("Skipping memcached connection")
+        mem_conn = None
+
     # Connect and authenticate to Vault
     conn = hvac.Client(url=CONF["url"])
     _authenticate(conn)
 
     # Apply the compound filters to determine which secrets to expose for this minion
     ckminions = salt.utils.minions.CkMinions(__opts__)
-    for filter, secrets in secret_map.items():
-        minions =  ckminions.check_minions(filter, "compound")
+    for fltr, secrets in secret_map.items():
+        minions =  ckminions.check_minions(fltr, "compound")
         if 'minions' in minions:
             # In Salt 2018 this is now in a kwarg
             minions = minions['minions']
         if minion_id in minions:
             for variable, location in secrets.items():
-                return_data = couple(location, conn)
-                if return_data:
-                    vault_pillar[variable] = return_data
+                value = fetch(conn,
+                              mem_conn,
+                              location,
+                              expire_seconds=CONF['memcached_expiration'],
+                              unset_if_missing=CONF['unset_if_missing'])
+                if value:
+                    vault_pillar[variable] = value
 
+    if memcache_enabled:
+        mem_conn.close()
 
     return vault_pillar
