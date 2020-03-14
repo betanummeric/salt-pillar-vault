@@ -67,14 +67,20 @@ top file, and will be processed as a Jinja template:
       'variable': 'path'
       'variable': 'path?key'
     'filter':
-      'variable': 'path?key'
+      'variable':
+        'variable':
+          - 'variable': 'path?key'
+      'variable':
+        - 'variable':
+            'variable': 'path?key'
 ```
 
 Each `filter` is a compound matcher:
     https://docs.saltstack.com/en/latest/topics/targeting/compound.html
 
 `variable` is the name of the variable which will be injected into the
-pillar data.
+pillar data. Variables may contain arbitrary nested dicts and lists of
+other variables, as long as the leaves of the structure are 'path?key' strings.
 
 `path` is the path the desired secret on the Vault server.
 

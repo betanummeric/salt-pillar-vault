@@ -64,14 +64,20 @@ top file:
       'variable': 'path'
       'variable': 'path?key'
     'filter':
-      'variable': 'path?key'
+      'variable':
+        'variable':
+          - 'variable': 'path?key'
+      'variable':
+        - 'variable':
+            'variable': 'path?key'
 
 
 Each ``filter`` is a compound matcher:
     https://docs.saltstack.com/en/latest/topics/targeting/compound.html
 
 ``variable`` is the name of the variable which will be injected into the
-pillar data.
+pillar data. Variables may contain arbitrary nested dicts and lists of
+other variables, as long as the leaves of the structure are 'path?key' strings.
 
 ``path`` is the path the desired secret on the Vault server.
 
@@ -226,6 +232,28 @@ def couple(location, conn):
         return coupled_data
 
 
+def traverse_and_couple(item, conn):
+    """
+    traverse recursively 'item', an arbitrary nesting of dicts and lists
+    all leaves that are strings will be replaced using couple()
+    other leaves will be removed
+    the resulting object is returned
+    """
+    if isinstance(item, str):
+        return couple(item, conn)
+    elif isinstance(item, list):
+        return [traverse_and_couple(x, conn) for x in item]
+    elif isinstance(item, dict):
+        return_data = {}
+        for key, value in item.items():
+            new_value = traverse_and_couple(value, conn)
+            if new_value:
+                return_data[key] = new_value
+        return return_data
+    else:
+        return None
+
+
 
 def ext_pillar(minion_id, pillar, *args, **kwargs):
     """ Main handler. Compile pillar data for the specified minion ID
@@ -270,7 +298,7 @@ def ext_pillar(minion_id, pillar, *args, **kwargs):
             minions = minions['minions']
         if minion_id in minions:
             for variable, location in secrets.items():
-                return_data = couple(location, conn)
+                return_data = traverse_and_couple(location, conn)
                 if return_data:
                     vault_pillar[variable] = return_data
 
