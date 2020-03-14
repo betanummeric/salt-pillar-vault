@@ -204,7 +204,7 @@ def couple(location, conn):
     If location is a string, return the value looked up from vault.
     """
     coupled_data = {}
-    if isinstance(location, basestring):
+    if isinstance(location, str):
         try:
             (path, key) = location.split('?', 1)
         except ValueError:
