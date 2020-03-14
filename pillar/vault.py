@@ -215,6 +215,8 @@ def couple(location, conn):
             prefix = "base64:"
             if secret and secret.startswith(prefix):
                 secret = base64.b64decode(secret[len(prefix):]).rstrip()
+        else:
+            secret = secret["data"]
         if secret or not CONF["unset_if_missing"]:
             return secret
     elif isinstance(location, dict):
