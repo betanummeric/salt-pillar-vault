@@ -216,6 +216,8 @@ def couple(location, conn):
         except ValueError:
             (path, key) = (location, None)
         secret = conn.read(path)
+        if secret is None:
+            raise Exception(f"vault path {path} returned None")
         if key:
             secret = secret["data"].get(key, None)
             prefix = "base64:"
